@@ -102,25 +102,6 @@ void pre_populate(struct page_header *page){
 	insert_page_to(page, &m.free_list[page->size_class]);
 }
 
-
-// static inline void dump_freelist(){
-// 	uint32_t i = 0;
-// 	while(i < BINS){
-// 		printf("size:%u\n",size_freelist[i]);
-// 		struct header *curr = m.free_list[i];
-// 		uint32_t count = 0;
-// 		while(curr){
-// 			printf("%p, next:%p, prev:%p\n", curr, curr->next, curr->prev);
-// 			curr = curr->next;
-// 			count++;
-// 		}
-// 		printf("count:%u\n", count);
-// 		count = 0;
-// 		printf("\n");
-// 		i++;
-// 	}
-// }
-
 static void inline rm_from_free(struct header *free, struct page_header *page){
 	if(free->prev)free->prev->next = free->next;
 	if(free->next)free->next->prev = free->prev;
