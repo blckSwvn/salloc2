@@ -18,7 +18,7 @@ struct page_header {
 	struct page_header *next;
 	struct page_header *prev;
 	struct header *head;
-	uint32_t size_class;
+	size_t size_class;
 	uint32_t blocks_used;
 };
 
@@ -152,23 +152,22 @@ void *salloc(size_t len){
 	}
 	if(free)return (void *)free;
 
-	if(global_m.free_page_list[z]){
-		struct page_header *page = global_m.free_page_list[z];
+	mtx_lock(&global_m.free_lock[z]);
+	struct page_header *page = global_m.free_page_list[z];
+	if(page) rm_page_from(page, &global_m.free_page_list[z]);
+	mtx_unlock(&global_m.free_lock[z]);
 
-		mtx_lock(&global_m.free_lock[z]);
-		rm_page_from(page, &global_m.free_page_list[z]);
-		mtx_unlock(&global_m.free_lock[z]);
+	if(page){
+	mtx_lock(&global_m.used_lock[z]);
+	insert_page_to(page, &global_m.used_page_list[z]);
+	mtx_unlock(&global_m.used_lock[z]);
 
-		mtx_lock(&global_m.used_lock[z]);
-		insert_page_to(page, &global_m.used_page_list[z]);
-		mtx_unlock(&global_m.used_lock[z]);
-
-		// page->size_class = z; shouldnt be changed its already set in
-		page->blocks_used = 1;
-		void *temp = page->head;
-		rm_page_from(page, &m.free_list[z]);
-		page->head = page->head->next;
-		return temp;
+	// page->size_class = z; shouldnt be changed its already set in
+	page->blocks_used = 1;
+	void *temp = page->head;
+	insert_page_to(page, &m.free_list[z]);
+	page->head = page->head->next;
+	return temp;
 	} else {
 		struct page_header *new = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		mtx_lock(&global_m.used_lock[z]);
