@@ -15,24 +15,25 @@ struct header {
 };
 
 struct page_header {
-	uint32_t size_class;
-	uint32_t blocks_used;
 	struct page_header *next;
 	struct page_header *prev;
+	struct header *head;
+	uint32_t size_class;
+	uint32_t blocks_used;
 };
 
 #define BINS 8
 
 struct master {
-	struct header *free_list[BINS];
+	struct page_header *free_list[BINS];
 	size_t used;
 	size_t free;
 };
 
 struct global_master {
 	struct page_header *free_page_list[BINS];
-	mtx_t free_lock[BINS];
 	struct page_header *used_page_list[BINS];
+	mtx_t free_lock[BINS];
 	mtx_t used_lock[BINS];
 };
 
@@ -73,45 +74,6 @@ static inline struct page_header *get_header(void *ptr){
 	return (void *)header;
 }
 
-void pre_populate(struct page_header *page){
-	uint32_t size = size_freelist[page->size_class];
-	struct header *tail = (struct header *)((char *)page + sizeof(struct page_header) + size);
-	void *page_end = ((char *)page + PAGE_SIZE);
-
-	while(((char *)tail + size) <= ((char *)page + PAGE_SIZE)){
-		if(m.free_list[page->size_class]){
-			m.free_list[page->size_class]->prev = tail;
-			tail->next = m.free_list[page->size_class];
-		} else tail->next = NULL;
-		m.free_list[page->size_class] = tail; 
-		tail = (struct header *)((char *)tail + size);
-	}
-}
-
-static inline void dump_freelist(){
-	uint32_t i = 0;
-	while(i < BINS){
-		printf("size:%u\n",size_freelist[i]);
-		struct header *curr = m.free_list[i];
-		uint32_t count = 0;
-		while(curr){
-			printf("%p, next:%p, prev:%p\n", curr, curr->next, curr->prev);
-			curr = curr->next;
-			count++;
-		}
-		printf("count:%u\n", count);
-		count = 0;
-		printf("\n");
-		i++;
-	}
-}
-
-static void inline rm_from_free(struct header *free, uint32_t i){
-	if(free->prev)free->prev->next = free->next;
-	if(free->next)free->next->prev = free->prev;
-	if(m.free_list[i] == free)m.free_list[i] = free->next;
-}
-
 static void inline insert_page_to(struct page_header *page, struct page_header **head){
 	page->prev = NULL;
 	if(*head)(*head)->prev = page;
@@ -119,11 +81,66 @@ static void inline insert_page_to(struct page_header *page, struct page_header *
 	*head = page;
 }
 
+void pre_populate(struct page_header *page){
+	uint32_t size = size_freelist[page->size_class];
+	struct header *block = (struct header *)((char *)page + size + sizeof(struct page_header)); //must skip first block
+	void *page_end = ((char *)page + PAGE_SIZE);
+
+	struct header *head = NULL;
+
+	while(((char *)block + size) <= ((char *)page_end)){
+		block->prev = NULL;
+		if(head){
+			block->next = head;
+			head->prev = block;
+		} else block->next = NULL;
+
+		head = block;
+		block = (struct header *)((char *)block + size);
+	}
+	page->head = head;
+	insert_page_to(page, &m.free_list[page->size_class]);
+}
+
+
+// static inline void dump_freelist(){
+// 	uint32_t i = 0;
+// 	while(i < BINS){
+// 		printf("size:%u\n",size_freelist[i]);
+// 		struct header *curr = m.free_list[i];
+// 		uint32_t count = 0;
+// 		while(curr){
+// 			printf("%p, next:%p, prev:%p\n", curr, curr->next, curr->prev);
+// 			curr = curr->next;
+// 			count++;
+// 		}
+// 		printf("count:%u\n", count);
+// 		count = 0;
+// 		printf("\n");
+// 		i++;
+// 	}
+// }
+
+static void inline rm_from_free(struct header *free, struct page_header *page){
+	if(free->prev)free->prev->next = free->next;
+	if(free->next)free->next->prev = free->prev;
+	if(page->head == free)page->head = free->next;
+}
+
+static void inline insert_free(struct header *free, struct page_header *page){
+	if(page->head)page->head->prev = free;
+	free->next = page->head;
+	page->head = free;
+	free->prev = NULL;
+}
+
+
 static void inline rm_page_from(struct page_header *page, struct page_header **head){
 	if(page->prev)page->prev->next = page->next;
 	if(page->next)page->next->prev = page->prev;
 	if(*head == page)*head = page->next;
 }
+
 
 void *salloc(size_t len){
 	call_once(&once, init);
@@ -143,10 +160,11 @@ void *salloc(size_t len){
 	uint32_t i = z; //first valid page INDEX of big enough size
 	struct header *free = NULL;
 	while(i < BINS){
-		free = m.free_list[i];
-		if(free){
-			rm_from_free(free, i);
-			get_header(free)->blocks_used++;
+		if(m.free_list[i] && m.free_list[i]->head){
+			free = m.free_list[i]->head;
+			struct page_header *page = get_header(free);
+			rm_from_free(free, page);
+			page->blocks_used++;
 			break;
 		}
 		i++;
@@ -164,10 +182,12 @@ void *salloc(size_t len){
 		insert_page_to(page, &global_m.used_page_list[z]);
 		mtx_unlock(&global_m.used_lock[z]);
 
-		page->size_class = z;
+		// page->size_class = z; shouldnt be changed its already set in
 		page->blocks_used = 1;
-		pre_populate(page);
-		return (void *)((char *)page + sizeof(struct page_header));
+		void *temp = page->head;
+		rm_page_from(page, &m.free_list[z]);
+		page->head = page->head->next;
+		return temp;
 	} else {
 		struct page_header *new = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		mtx_lock(&global_m.used_lock[z]);
@@ -181,6 +201,7 @@ void *salloc(size_t len){
 	}
 }
 
+
 void sfree(void *ptr){
 	struct header *block = ptr;
 	struct page_header *page = get_header(ptr);
@@ -190,17 +211,12 @@ void sfree(void *ptr){
 		return;
 	}
 
+
+	insert_free(block, page);
+
 	page->blocks_used--;
 	if(!page->blocks_used){
-		uint32_t i = 0;
-		void *tail = (void *)((char *)page + sizeof(struct page_header));
-		void *page_end = (void *)((char *)page + PAGE_SIZE);
-		size_t size = size_freelist[page->size_class];
-		while((void *)((char *)tail + size) <= page_end){
-			rm_from_free(tail, page->size_class);
-			tail = (void *)((char *)tail + size);
-			i++;
-		}
+		rm_page_from(page, &m.free_list[page->size_class]);
 		mtx_lock(&global_m.used_lock[page->size_class]);
 		rm_page_from(page, &global_m.used_page_list[page->size_class]);
 		mtx_unlock(&global_m.used_lock[page->size_class]);
@@ -211,11 +227,6 @@ void sfree(void *ptr){
 		return;
 	}
 
-	if(m.free_list[page->size_class])
-		m.free_list[page->size_class]->prev = block;
-
-	block->next = m.free_list[page->size_class];
-	m.free_list[page->size_class] = block;
 	return;
 }
 
