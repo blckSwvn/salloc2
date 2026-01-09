@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O0 -fsanitize=address,undefined -g
+CFLAGS = -Wall -Wextra -O2 -fsanitize=address,undefined -g
 INCLUDES = -I./salloc
 TARGET = main
 
