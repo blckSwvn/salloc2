@@ -18,11 +18,11 @@ struct page_header {
 	struct page_header *next;
 	struct page_header *prev;
 	struct header *head;
-	size_t size_class;
+	size_t size_index; //index except when size_index > size_freelist[BINS-1] then its raw size
 	uint32_t blocks_used;
 };
 
-#define BINS 8
+#define BINS 15
 
 struct master {
 	struct page_header *free_list[BINS];
@@ -37,8 +37,8 @@ struct global_master {
 	mtx_t used_lock[BINS];
 };
 
-static const uint32_t size_freelist[BINS] = {
-	16, 32, 64, 128, 256, 512, 1024, 2048
+static const size_t size_freelist[BINS] = {
+	16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
 };
 
 struct global_master global_m = {
@@ -63,8 +63,19 @@ thread_local struct master m = {
 #define PAGE_SIZE 4096
 
 size_t align(size_t len){
-	if(len < sizeof(struct header))
+	if(len < sizeof(struct header)){
 		len = sizeof(struct header);
+		return len;
+	}
+	if(len < size_freelist[BINS-1]){
+		uint32_t i = 0;
+		while(i < BINS){
+			if(size_freelist[i] >= len){
+				return size_freelist[i];
+			}
+			i++;
+		}
+	}
 	return (len + 15) & ~((size_t)15);
 }
 
@@ -82,7 +93,7 @@ static void inline insert_page_to(struct page_header *page, struct page_header *
 }
 
 void pre_populate(struct page_header *page){
-	uint32_t size = size_freelist[page->size_class];
+	uint32_t size = size_freelist[page->size_index];
 	struct header *block = (struct header *)((char *)page + size + sizeof(struct page_header)); //must skip first block
 	void *page_end = ((char *)page + PAGE_SIZE);
 
@@ -99,7 +110,7 @@ void pre_populate(struct page_header *page){
 		block = (struct header *)((char *)block + size);
 	}
 	page->head = head;
-	insert_page_to(page, &m.free_list[page->size_class]);
+	insert_page_to(page, &m.free_list[(page->size_index)]);
 }
 
 static void inline rm_from_free(struct header *free, struct page_header *page){
@@ -126,9 +137,9 @@ static void inline rm_page_from(struct page_header *page, struct page_header **h
 void *salloc(size_t len){
 	call_once(&once, init);
 	len = align(len);
-	if(len >= size_freelist[BINS-1]){
+	if(len > size_freelist[BINS-1]){
 		struct page_header *curr = mmap(NULL, len + sizeof(struct page_header), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		curr->size_class = len;
+		curr->size_index = len;
 		// curr->blocks_used = 1;
 		return ((char*)curr + sizeof(struct page_header));
 	}
@@ -138,7 +149,7 @@ void *salloc(size_t len){
 		if(size_freelist[z] >= len)
 			break;
 
-	uint32_t i = z; //first valid page INDEX of big enough size
+	uint32_t i = z; //first valid block INDEX of big enough size
 	struct header *free = NULL;
 	while(i < BINS){
 		if(m.free_list[i] && m.free_list[i]->head){
@@ -174,7 +185,7 @@ void *salloc(size_t len){
 		insert_page_to(new, &global_m.used_page_list[z]);
 		mtx_unlock(&global_m.used_lock[z]);
 		if(!new)return NULL;
-		new->size_class = z;
+		new->size_index = z;
 		new->blocks_used = 1;
 		pre_populate(new);
 		return (void *)((char *)new+sizeof(struct page_header));
@@ -186,8 +197,8 @@ void sfree(void *ptr){
 	struct header *block = ptr;
 	struct page_header *page = get_header(ptr);
 
-	if(page->size_class >= size_freelist[BINS-1]){
-		munmap(page, page->size_class + sizeof(struct page_header));
+	if(page->size_index > size_freelist[BINS-1]){
+		munmap(page, page->size_index + sizeof(struct page_header));
 		return;
 	}
 
@@ -196,14 +207,14 @@ void sfree(void *ptr){
 
 	page->blocks_used--;
 	if(!page->blocks_used){
-		rm_page_from(page, &m.free_list[page->size_class]);
-		mtx_lock(&global_m.used_lock[page->size_class]);
-		rm_page_from(page, &global_m.used_page_list[page->size_class]);
-		mtx_unlock(&global_m.used_lock[page->size_class]);
+		rm_page_from(page, &m.free_list[page->size_index]);
+		mtx_lock(&global_m.used_lock[page->size_index]);
+		rm_page_from(page, &global_m.used_page_list[page->size_index]);
+		mtx_unlock(&global_m.used_lock[page->size_index]);
 
-		mtx_lock(&global_m.free_lock[page->size_class]);
-		insert_page_to(page, &global_m.free_page_list[page->size_class]);
-		mtx_unlock(&global_m.free_lock[page->size_class]);
+		mtx_lock(&global_m.free_lock[page->size_index]);
+		insert_page_to(page, &global_m.free_page_list[page->size_index]);
+		mtx_unlock(&global_m.free_lock[page->size_index]);
 		return;
 	}
 
@@ -214,6 +225,6 @@ void *srealloc(void *ptr, size_t len){
 	len = align(len);
 	void *new = salloc(len);
 	if(!new)return NULL;
-	memcpy(new, ptr, size_freelist[get_header(ptr)->size_class]);
+	memcpy(new, ptr, size_freelist[get_header(ptr)->size_index]);
 	return new;
 }
