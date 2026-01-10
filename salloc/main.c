@@ -156,29 +156,29 @@ void *salloc(size_t len){
 		if(m.free_list[i]){
 			if(m.free_list[i]->head){
 				free = m.free_list[i]->head;
-				struct page_header *page = get_header(free);
-				rm_from_free(free, page);
-				page->blocks_used++;
+				rm_from_free(free, m.free_list[i]);
+				m.free_list[i]->blocks_used++;
 				break;
-			} else if(m.free_list[i]->remote_head){
-				struct page_header *page = get_header(free);
-				mtx_lock(&m.free_list[i]->remote_lock);
-				struct header *remote = page->remote_head;
-				if(remote){
-					free = remote;
-					remote = remote->next;
-					while(remote){
-						struct header *next = remote->next;
-						insert_free(remote, page);
-						remote = next;
+			} else { 
+				if(m.free_list[i]->remote_head){
+					mtx_lock(&m.free_list[i]->remote_lock);
+					struct header *remote = m.free_list[i]->remote_head;
+					if(remote){
+						free = remote;
+						remote = remote->next;
+						while(remote){
+							struct header *next = remote->next;
+							insert_free(remote, m.free_list[i]);
+							remote = next;
+						}
+						m.free_list[i]->remote_head = NULL;
+						atomic_store(&m.free_list[i]->remote_frees, 0);
+						m.free_list[i]->blocks_used++;
+						mtx_unlock(&m.free_list[i]->remote_lock);
+						break;
 					}
-					m.free_list[i]->remote_head = NULL;
-					atomic_store(&m.free_list[i]->remote_frees, 0);
-					page->blocks_used++;
 					mtx_unlock(&m.free_list[i]->remote_lock);
-					break;
 				}
-				mtx_unlock(&m.free_list[i]->remote_lock);
 			}
 		}
 		i++;
