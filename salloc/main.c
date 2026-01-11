@@ -263,8 +263,11 @@ void sfree(void *ptr){
 
 void *srealloc(void *ptr, size_t len){
 	len = align(len);
+	struct page_header *page = get_header(ptr);
+	if(size_freelist[page->size_index] >= len)
+		return ptr;
 	void *new = salloc(len);
 	if(!new)return NULL;
-	memcpy(new, ptr, size_freelist[get_header(ptr)->size_index]);
+	memcpy(new, ptr, size_freelist[page->size_index]);
 	return new;
 }
