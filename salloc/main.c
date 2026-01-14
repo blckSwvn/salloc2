@@ -14,19 +14,13 @@ struct header {
 	struct header *prev;
 };
 
-#define BINS 15
-
-struct master {
-	struct page_header *free_list[BINS];
-	size_t used;
-	size_t free;
-};
+#define BINS 128
 
 struct page_header {
 	struct page_header *next;
 	struct page_header *prev;
 	struct header *remote_head; //while page in use
-	struct master *m; //while page in use
+	void *owner;
 	struct header *head;
 	size_t size_index; //index except when size_index > size_freelist[BINS-1] then its raw size
 	uint32_t blocks_used;
@@ -39,9 +33,13 @@ struct global_master {
 	mtx_t free_lock[BINS];
 };
 
-static const size_t size_freelist[BINS] = {
-	16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-};
+
+static const size_t max_slab = 2048;
+// static const size_t size_freelist[BINS] = {
+// 	16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+// };
+
+thread_local struct page_header *freelist[BINS];
 
 struct global_master global_m = {
 	.free_page_list = {NULL},
@@ -54,28 +52,9 @@ static void init(void){
 	}
 }
 
-thread_local struct master m = {
-	.free_list = {NULL},
-	.free = 0,
-	.used = 0,
-};
-
 #define PAGE_SIZE 4096
 
 size_t align(size_t len){
-	if(len < sizeof(struct header)){
-		len = sizeof(struct header);
-		return len;
-	}
-	if(len < size_freelist[BINS-1]){
-		uint32_t i = 0;
-		while(i < BINS){
-			if(size_freelist[i] >= len){
-				return size_freelist[i];
-			}
-			i++;
-		}
-	}
 	return (len + 15) & ~((size_t)15);
 }
 
@@ -93,8 +72,8 @@ static void inline insert_page_to(struct page_header *page, struct page_header *
 }
 
 void pre_populate(struct page_header *page){
-	uint32_t size = size_freelist[page->size_index];
-	struct header *block = (struct header *)((char *)page + size + sizeof(struct page_header)); //must skip first block
+	uint32_t size = (page->size_index+1)<<4;
+	struct header *block = (struct header *)((char *)page + size + sizeof(struct page_header)); //skips first block since its returned imediately
 	void *page_end = ((char *)page + PAGE_SIZE);
 
 	struct header *head = NULL;
@@ -110,7 +89,7 @@ void pre_populate(struct page_header *page){
 		block = (struct header *)((char *)block + size);
 	}
 	page->head = head;
-	insert_page_to(page, &m.free_list[(page->size_index)]);
+	insert_page_to(page, &freelist[(page->size_index)]);
 }
 
 static void inline rm_from_free(struct header *free, struct page_header *page){
@@ -137,47 +116,44 @@ static void inline rm_page_from(struct page_header *page, struct page_header **h
 void *salloc(size_t len){
 	call_once(&once, init);
 	len = align(len);
-	if(len > size_freelist[BINS-1]){
+	if(len > max_slab){
 		struct page_header *curr = mmap(NULL, len + sizeof(struct page_header), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		curr->size_index = len;
 		// curr->blocks_used = 1;
-		curr->m = &m;
+		curr->owner = *freelist;
 		return ((char*)curr + sizeof(struct page_header));
 	}
 
-	uint32_t z; //first page INDEX of big enough size regardless of NULL
-	for(z = 0; z < BINS; z++)
-		if(size_freelist[z] >= len)
-			break;
+	uint32_t z = (len/16)-1; //first page INDEX of big enough size regardless of NULL
 
 	uint32_t i = z; //first valid block INDEX of big enough size
 	struct header *free = NULL;
 	while(i < BINS){
-		if(m.free_list[i]){
-			if(m.free_list[i]->head){
-				free = m.free_list[i]->head;
-				rm_from_free(free, m.free_list[i]);
-				m.free_list[i]->blocks_used++;
+		if(freelist[i]){
+			if(freelist[i]->head){
+				free = freelist[i]->head;
+				rm_from_free(free, freelist[i]);
+				freelist[i]->blocks_used++;
 				break;
 			} else { 
-				if(m.free_list[i]->remote_head){
-					mtx_lock(&m.free_list[i]->remote_lock);
-					struct header *remote = m.free_list[i]->remote_head;
+				if(freelist[i]->remote_head){
+					mtx_lock(&freelist[i]->remote_lock);
+					struct header *remote = freelist[i]->remote_head;
 					if(remote){
 						free = remote;
 						remote = remote->next;
 						while(remote){
 							struct header *next = remote->next;
-							insert_free(remote, m.free_list[i]);
+							insert_free(remote, freelist[i]);
 							remote = next;
 						}
-						m.free_list[i]->remote_head = NULL;
-						atomic_store(&m.free_list[i]->remote_frees, 0);
-						m.free_list[i]->blocks_used++;
-						mtx_unlock(&m.free_list[i]->remote_lock);
+						freelist[i]->remote_head = NULL;
+						atomic_store(&freelist[i]->remote_frees, 0);
+						freelist[i]->blocks_used++;
+						mtx_unlock(&freelist[i]->remote_lock);
 						break;
 					}
-					mtx_unlock(&m.free_list[i]->remote_lock);
+					mtx_unlock(&freelist[i]->remote_lock);
 				}
 			}
 		}
@@ -193,21 +169,26 @@ void *salloc(size_t len){
 	mtx_unlock(&global_m.free_lock[z]);
 
 	if(page){
-		// page->size_class = z; shouldnt be changed its already set in
-		page->m = &m;
+		// page->size_index = z; shouldnt be changed its already set in
+		page->owner = *freelist;
 		page->remote_frees = 0;
 		page->remote_head = NULL;
 		page->blocks_used = 1;
 		void *temp = page->head;
-		insert_page_to(page, &m.free_list[z]);
+		insert_page_to(page, &freelist[z]);
 		page->head = page->head->next;
 		return temp;
 	} else {
 		struct page_header *new = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		madvise(new, PAGE_SIZE, MADV_NOHUGEPAGE);
 		if(!new)return NULL;
-		new->size_index = z;
-		new->prev = (struct page_header *)&m;
+
+		new->owner = *freelist;
+		new->remote_frees = 0;
+		new->remote_head = NULL;
 		new->blocks_used = 1;
+		new->size_index = z;
+		insert_page_to(new, &freelist[z]);
 		pre_populate(new);
 		mtx_init(&new->remote_lock, mtx_plain);
 		return (void *)((char *)new+sizeof(struct page_header));
@@ -218,9 +199,12 @@ void *salloc(size_t len){
 void sfree(void *ptr){
 	struct header *block = ptr;
 	struct page_header *page = get_header(ptr);
-	if(page->m != &m){ //remote free
+	if(page->owner != *freelist){ //remote free
+#ifdef DEBUG
+		printf("remote free!\n");
+#endif
 		mtx_lock(&page->remote_lock);
-		if(page->size_index > size_freelist[BINS-1]){
+		if(page->size_index > max_slab){
 			mtx_destroy(&page->remote_lock);
 			munmap(page, page->size_index + sizeof(struct page_header));
 			return;
@@ -234,7 +218,7 @@ void sfree(void *ptr){
 		return;
 	} 
 
-	if(page->size_index > size_freelist[BINS-1]){
+	if(page->size_index > max_slab){
 		mtx_destroy(&page->remote_lock);
 		munmap(page, page->size_index + sizeof(struct page_header));
 		return;
@@ -250,7 +234,7 @@ void sfree(void *ptr){
 			insert_free(remote, page);
 			remote = next;
 		}
-		rm_page_from(page, &m.free_list[page->size_index]);
+		rm_page_from(page, &freelist[page->size_index]);
 
 		mtx_lock(&global_m.free_lock[page->size_index]);
 		insert_page_to(page, &global_m.free_page_list[page->size_index]);
@@ -264,10 +248,10 @@ void sfree(void *ptr){
 void *srealloc(void *ptr, size_t len){
 	len = align(len);
 	struct page_header *page = get_header(ptr);
-	if(size_freelist[page->size_index] >= len)
+	if((page->size_index+15)/16-1 >= len)
 		return ptr;
 	void *new = salloc(len);
 	if(!new)return NULL;
-	memcpy(new, ptr, size_freelist[page->size_index]);
+	memcpy(new, ptr, (page->size_index+15)/16-1);
 	return new;
 }
