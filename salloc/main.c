@@ -255,3 +255,4 @@ void *srealloc(void *ptr, size_t len){
 	memcpy(new, ptr, (page->size_index+15)/16-1);
 	return new;
 }
+
